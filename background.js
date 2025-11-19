@@ -25,6 +25,8 @@ async function getHeaders() {
       const headers = { "Content-Type": "application/json" };
       if (data.ollamaApiKey) {
         // headers["Authorization"] = `Bearer ${data.ollamaApiKey}`;
+
+        // for developemnet and testin purpose
         headers["Authorization"] = `Bearer my-secret-key-123`;
       }
       resolve(headers);
@@ -208,9 +210,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           } catch (e) {
             logDebug(
               "AI response was not a structured action JSON.",
-              null,
+              responseText,
               tabId
             );
+            // Self-correction: If the AI responds with text, treat it as an observation and continue the loop.
+            sendPanelMessage(
+              {
+                type: "AUTOMATION_STATUS",
+                status: "error",
+                message: `AI did not return a valid JSON action. It said: "${responseText.substring(
+                  0,
+                  100
+                )}..."`,
+                action: "none", // Special action type to indicate a non-action
+              },
+              tabId
+            );
+            sendResponse({
+              status: "ok",
+              result: {
+                response: "AI response was not a valid action. Retrying...",
+              },
+            });
+            return; // Stop further processing for this invalid response
           }
 
           if (actionCommand && actionCommand.action) {
@@ -294,6 +316,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return;
           } else {
             // --- STANDARD TEXT RESPONSE PATH ---
+            // This path should ideally not be taken in automation mode.
+            // We can treat this as a failure to produce an action.
+            logDebug(
+              "AI returned a standard text response instead of an action.",
+              result,
+              tabId
+            );
+            sendPanelMessage(
+              {
+                type: "AUTOMATION_STATUS",
+                status: "error",
+                message: `AI did not return a valid JSON action. It said: "${result.response.substring(
+                  0,
+                  100
+                )}..."`,
+                action: "none",
+              },
+              tabId
+            );
             sendResponse({ status: "ok", result });
           }
         } else {

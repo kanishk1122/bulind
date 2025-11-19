@@ -99,6 +99,17 @@ function loadModels() {
 // --- Debug helpers (omitted for brevity, assume they are present) ---
 let DEBUG = false;
 
+function logStatus(message, isError = false) {
+  const entry = document.createElement("div");
+  entry.textContent = message;
+  if (isError) {
+    entry.style.color = "red";
+    entry.style.fontWeight = "bold";
+  }
+  resultDiv.appendChild(entry);
+  resultDiv.scrollTop = resultDiv.scrollHeight;
+}
+
 function logToUI(message, ...args) {
   if (DEBUG) {
     const logEntry = document.createElement("div");
@@ -159,21 +170,23 @@ function runAutomationLoop() {
     return;
   }
 
-  resultDiv.textContent = "Capturing screen and page state...";
+  logStatus("Capturing screen and page state...");
 
   getPageHTMLEval((html) => {
     if (!html) {
-      resultDiv.textContent =
-        "Error: Failed to get page HTML. Stopping automation.";
+      logStatus("Error: Failed to get page HTML. Stopping automation.", true);
       isAutomationRunning = false;
       return;
     }
 
     chrome.tabs.get(INSPECTED_TAB_ID, (tab) => {
       if (chrome.runtime.lastError || !tab) {
-        resultDiv.textContent = `Error getting tab details: ${
-          chrome.runtime.lastError?.message || "Unknown error"
-        }. Stopping automation.`;
+        logStatus(
+          `Error getting tab details: ${
+            chrome.runtime.lastError?.message || "Unknown error"
+          }. Stopping automation.`,
+          true
+        );
         isAutomationRunning = false;
         return;
       }
@@ -183,15 +196,17 @@ function runAutomationLoop() {
         { format: "jpeg" },
         (dataUrl) => {
           if (chrome.runtime.lastError || !dataUrl) {
-            resultDiv.textContent = `Error capturing screen: ${
-              chrome.runtime.lastError?.message || "Unknown error"
-            }. Stopping automation.`;
+            logStatus(
+              `Error capturing screen: ${
+                chrome.runtime.lastError?.message || "Unknown error"
+              }. Stopping automation.`,
+              true
+            );
             isAutomationRunning = false;
             return;
           }
 
-          resultDiv.textContent =
-            "Analyzing screenshot and deciding next action...";
+          logStatus("Analyzing screenshot and deciding next action...");
           const base64Image = dataUrl.split(",")[1];
           const model = Array.from(modelSel.options).find(
             (opt) =>
@@ -215,7 +230,7 @@ You have the following actions available:
 - "done": Signals that the user's request is complete. Use this when you believe the task is fully finished.
 - "answer": Respond with a text answer if the user asks a question you can answer from the context. Requires a "value".
 
-Your response MUST be a single JSON object with the format:
+Your response MUST be a single JSON object and nothing else. Do not add explanations or conversational text.
 {"action": "action_name", "selector": "css_selector", "value": "text_or_number"}
 
 - The "selector" must be a valid and specific CSS selector.
@@ -244,9 +259,12 @@ ${html}
             },
             (resp) => {
               if (!resp || resp.status === "error") {
-                resultDiv.textContent = `Error from AI: ${
-                  resp?.message || "No response"
-                }. Stopping automation.`;
+                logStatus(
+                  `Error from AI: ${
+                    resp?.message || "No response"
+                  }. Stopping automation.`,
+                  true
+                );
                 isAutomationRunning = false;
                 return;
               }
@@ -259,7 +277,7 @@ ${html}
               // The background script will now handle the action and send a status update,
               // which will trigger the next loop iteration via the message listener.
               // We just display the intended action here.
-              resultDiv.textContent = `AI decided action: ${text}`;
+              logStatus(`AI decided action: ${text}`);
               // The 'AUTOMATION_STATUS' message listener will call runAutomationLoop() again.
             }
           );
@@ -351,7 +369,7 @@ function setupEventListeners() {
       isAutomationRunning = false;
       askBtn.disabled = false;
       askWithScreenshotBtn.textContent = "Ask with Screenshot";
-      resultDiv.textContent = "Automation stopped by user.";
+      logStatus("Automation stopped by user.");
       return;
     }
 
@@ -374,9 +392,10 @@ function setupEventListeners() {
     // Start the automation loop
     isAutomationRunning = true;
     conversationHistory = []; // Reset history for a new task
+    resultDiv.innerHTML = ""; // Clear the log only when starting a new automation task
     askBtn.disabled = true;
     askWithScreenshotBtn.textContent = "Stop Automation";
-    resultDiv.textContent = "Starting automation...";
+    logStatus("Starting automation...");
     runAutomationLoop();
   });
 
@@ -422,7 +441,7 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
       msg.status === "error"
     ) {
       isAutomationRunning = false;
-      resultDiv.appendChild(document.createTextNode("\nAutomation finished."));
+      logStatus("Automation finished.");
     }
 
     // Trigger the next step of the loop after a short delay
