@@ -6,6 +6,32 @@ const OLLAMA_BASE = "http://localhost:11434";
 // Store history per tab
 const tabHistories = {};
 
+function logDebug(message, data, tabId) {
+  if (DEBUG) {
+    console.log(`[Ollama Assistant BG] ${message}`, data || "");
+    // Send log to the panel UI if a tabId is provided
+    if (tabId) {
+      sendPanelMessage(
+        { type: "DEBUG_LOG", message, data: data || null },
+        tabId
+      );
+    }
+  }
+}
+
+async function getHeaders() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get("ollamaApiKey", (data) => {
+      const headers = { "Content-Type": "application/json" };
+      if (data.ollamaApiKey) {
+        // headers["Authorization"] = `Bearer ${data.ollamaApiKey}`;
+        headers["Authorization"] = `Bearer my-secret-key-123`;
+      }
+      resolve(headers);
+    });
+  });
+}
+
 async function callOllamaGenerate(
   model,
   prompt,
@@ -14,15 +40,7 @@ async function callOllamaGenerate(
   image = null,
   history = []
 ) {
-  if (DEBUG) {
-    console.log("[Ollama Assistant BG]", "Calling Ollama...", {
-      model,
-      stream,
-      promptLength: prompt.length,
-      hasImage: !!image,
-      historyLength: history.length,
-    });
-  }
+  logDebug("Calling Ollama...", { model, stream, hasImage: !!image }, tabId);
 
   const body = { model, prompt, stream };
   if (image) {
@@ -38,19 +56,16 @@ async function callOllamaGenerate(
     delete body.images; // Images are now inside the message
   }
 
+  const headers = await getHeaders();
   const resp = await fetch(`${OLLAMA_BASE}/api/generate`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: headers,
     body: JSON.stringify(body),
   });
 
   if (!resp.ok) {
     const errorText = await resp.text();
-    console.error(
-      "[Ollama Assistant BG] Ollama API error:",
-      resp.status,
-      errorText
-    );
+    logDebug("Ollama API error", { status: resp.status, errorText }, tabId);
     throw new Error(
       `Ollama API error: ${resp.status} ${resp.statusText}. Check server logs for details.`
     );
@@ -58,13 +73,7 @@ async function callOllamaGenerate(
 
   if (!stream) {
     const result = await resp.json();
-    if (DEBUG) {
-      console.log(
-        "[Ollama Assistant BG]",
-        "Ollama non-stream response",
-        result
-      );
-    }
+    logDebug("Ollama non-stream response", result, tabId);
     return result;
   } else {
     // Handle streaming response
@@ -126,8 +135,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Debug Control Messages (SET_DEBUG, GET_DEBUG, DEBUG_PING)
       if (message.type === "SET_DEBUG") {
         DEBUG = !!message.enabled;
-        if (DEBUG)
-          console.log("[Ollama Assistant BG]", "Debug mode set to", DEBUG);
+        console.log("[Ollama Assistant BG]", "Debug mode set to", DEBUG);
         sendResponse({ status: "ok", debug: DEBUG });
         return;
       } else if (message.type === "GET_DEBUG") {
@@ -148,6 +156,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           stream = false,
           tabId,
           image = null,
+          history = [], // Receive history from panel
         } = message;
 
         if (!model) {
@@ -156,19 +165,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           );
         }
 
-        // Get history for the current tab
-        const history = tabHistories[tabId] || [];
-
-        if (DEBUG) {
-          console.log("[Ollama Assistant BG]", "Received ASK_OLLAMA message:", {
-            model,
-            promptLength: prompt.length,
-            stream,
-            tabId, // Log the received tabId
-            hasImage: !!image,
-            historyLength: history.length,
-          });
-        }
+        logDebug("Received ASK_OLLAMA message", message, tabId);
 
         if (!tabId) {
           throw new Error(
@@ -186,19 +183,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         );
 
         if (!stream) {
-          // Add user prompt and AI response to history
-          if (!tabHistories[tabId]) {
-            tabHistories[tabId] = [];
-          }
-          tabHistories[tabId].push({
-            role: "user",
-            content: prompt,
-            images: image ? [image] : undefined,
-          });
-          tabHistories[tabId].push({
+          // The panel now manages history based on action outcomes.
+          // We only add the AI's direct response here.
+          const assistantResponse = {
             role: "assistant",
             content: result.response,
-          });
+          };
+          if (!tabHistories[tabId]) tabHistories[tabId] = [];
+          tabHistories[tabId].push(assistantResponse);
 
           // Non-streaming path: Check if the result is a structured action command
           let actionCommand = null;
@@ -212,39 +204,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
           try {
             actionCommand = JSON.parse(responseText);
-            if (DEBUG) {
-              console.log(
-                "[Ollama Assistant BG]",
-                "Parsed action command:",
-                actionCommand
-              );
-            }
+            logDebug("Parsed action command", actionCommand, tabId);
           } catch (e) {
-            if (DEBUG) {
-              console.log(
-                "[Ollama Assistant BG]",
-                "AI response was not a structured action JSON."
-              );
-            }
+            logDebug(
+              "AI response was not a structured action JSON.",
+              null,
+              tabId
+            );
           }
 
           if (actionCommand && actionCommand.action) {
-            if (actionCommand.action === "error") {
-              // AI explicitly returned an error message
-              result.response =
-                actionCommand.message ||
-                "The AI returned an unspecified error.";
-              sendResponse({ status: "ok", result });
+            if (
+              actionCommand.action === "error" ||
+              actionCommand.action === "done" ||
+              actionCommand.action === "answer"
+            ) {
+              // AI explicitly returned a terminal or informational action.
+              // Forward this status directly to the panel.
+              sendPanelMessage(
+                {
+                  type: "AUTOMATION_STATUS",
+                  status: "ok",
+                  message:
+                    actionCommand.message ||
+                    `Task marked as ${actionCommand.action}.`,
+                  action: actionCommand.action, // Pass the action type
+                },
+                tabId
+              );
+              // Send a simple response back to the original caller in the panel
+              sendResponse({
+                status: "ok",
+                result: { response: `Action: ${actionCommand.action}` },
+              });
               return;
             }
 
             // --- AUTOMATION PATH ---
-            if (DEBUG) {
-              console.log(
-                "[Ollama Assistant BG]",
-                `Relaying action '${actionCommand.action}' to Content Script in tab ${tabId}`
-              );
-            } // Use the passed tabId for sending the message
+            logDebug(
+              `Relaying action '${actionCommand.action}' to Content Script`,
+              actionCommand,
+              tabId
+            );
 
             chrome.tabs.sendMessage(
               tabId,
@@ -254,34 +255,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 const recipientId = tabId; // sender.tab is undefined from devtools, so this is always the inspected tabId
 
                 if (chrome.runtime.lastError) {
-                  if (DEBUG) {
-                    console.error(
-                      "[Ollama Assistant BG] Error sending action to content script:",
-                      chrome.runtime.lastError.message
-                    );
-                  }
+                  logDebug(
+                    "Error sending action to content script",
+                    chrome.runtime.lastError.message,
+                    recipientId
+                  );
                   // Send failure status back to the panel
                   sendPanelMessage(
                     {
                       type: "AUTOMATION_STATUS",
                       status: "error",
                       message: `Failed to communicate with content script: ${chrome.runtime.lastError.message}`,
+                      action: actionCommand.action,
                     },
                     recipientId
                   );
                 } else {
-                  if (DEBUG) {
-                    console.log(
-                      "[Ollama Assistant BG] Content script response:",
-                      contentResp
-                    );
-                  }
+                  logDebug("Content script response", contentResp, recipientId);
                   // Send the Content Script's execution status back to the panel
                   sendPanelMessage(
                     {
                       type: "AUTOMATION_STATUS",
                       status: contentResp.status,
                       message: contentResp.message,
+                      action: actionCommand.action, // Pass the action type
                     },
                     recipientId
                   );
@@ -304,7 +301,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ status: "ok", result });
         }
       } else if (message.type === "LIST_MODELS") {
-        const resp = await fetch(`${OLLAMA_BASE}/api/tags`);
+        const headers = await getHeaders();
+        const resp = await fetch(`${OLLAMA_BASE}/api/tags`, {
+          method: "GET",
+          headers: headers,
+        });
         if (!resp.ok) {
           throw new Error(
             `Ollama API error: ${resp.status} ${resp.statusText}`
@@ -316,8 +317,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ status: "error", message: "unknown type" });
       }
     } catch (err) {
-      console.error("[Ollama Assistant BG] handler error", err && err.message);
-      sendResponse({ status: "error", message: err.message });
+      console.error("[Ollama Assistant BG] handler error", err);
+      let detailedMessage = err.message;
+      if (err.message.includes("Failed to fetch")) {
+        detailedMessage = `Failed to connect to Ollama at ${OLLAMA_BASE}. Please ensure the Ollama server is running and accessible.`;
+      }
+      sendResponse({ status: "error", message: detailedMessage });
     }
   })();
   return true; // Keep channel open for asynchronous sendResponse

@@ -56,6 +56,16 @@
         align-items: center;
         gap: 5px;
       }
+      .debug-log {
+        font-family: monospace;
+        font-size: 12px;
+        color: #666;
+        background-color: #f7f7f7;
+        padding: 4px;
+        margin-top: 4px;
+        border-left: 3px solid #007bff;
+        white-space: pre-wrap;
+      }
     </style>
   </head>
   <body>
@@ -69,6 +79,18 @@
           </div>
           <label><input type="checkbox" id="stream" /> Stream</label>
           <button id="debugToggle">Debug OFF</button>
+        </div>
+        <div class="row">
+          <label for="apiKey" style="white-space: nowrap; align-self: center"
+            >API Key:</label
+          >
+          <input
+            type="password"
+            id="apiKey"
+            placeholder="Optional: Enter Ollama API Key"
+            style="flex-grow: 1"
+          />
+          <button id="saveApiKey">Save</button>
         </div>
         <textarea
           id="prompt"
