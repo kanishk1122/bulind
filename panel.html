@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Ollama Assistant</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        background-color: #f0f0f0;
+        color: #333;
+        padding: 10px;
+        font-size: 14px;
+      }
+      .container {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        border-bottom: 1px solid #ccc;
+        padding-bottom: 10px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        width: 100%;
+      }
+      textarea {
+        width: 100%;
+        min-height: 100px;
+        box-sizing: border-box;
+        resize: vertical;
+      }
+      #result {
+        flex-grow: 1;
+        background: #fff;
+        border: 1px solid #ccc;
+        padding: 8px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        margin-top: 10px;
+      }
+      button {
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+      select,
+      input {
+        padding: 8px;
+      }
+      .model-refresh {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="controls">
+        <div class="row">
+          <button id="usePage">Use Page Context</button>
+          <div class="model-refresh">
+            <select id="model"></select>
+            <button id="refreshModels" title="Refresh Models">🔄</button>
+          </div>
+          <label><input type="checkbox" id="stream" /> Stream</label>
+          <button id="debugToggle">Debug OFF</button>
+        </div>
+        <textarea
+          id="prompt"
+          placeholder="Enter your command... e.g., 'Click the login button' or 'Type 'hello world' into the search bar'"
+        ></textarea>
+        <div class="row">
+          <button id="ask">Ask</button>
+          <button id="askWithScreenshot">Ask with Screenshot</button>
+        </div>
+      </div>
+      <div
+        id="screenshotContainer"
+        style="display: none; margin-top: 10px; text-align: center"
+      >
+        <p>Click on the element in the screenshot you want to interact with.</p>
+        <img
+          id="screenshotImage"
+          style="max-width: 100%; border: 2px solid #007bff; cursor: crosshair"
+        />
+      </div>
+      <div id="result">Welcome to Ollama Assistant!</div>
+    </div>
+    <script src="panel.js"></script>
+  </body>
+</html>
