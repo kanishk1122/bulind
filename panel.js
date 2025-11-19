@@ -62,12 +62,14 @@ let originalUserPrompt = "";
 
 // --- Function to load models ---
 function loadModels() {
+  if (!chrome.runtime?.id) return; // Safety check
   refreshModelsBtn.textContent = "⏳";
   refreshModelsBtn.disabled = true;
   modelSel.innerHTML = '<option value="">Loading...</option>';
   askBtn.disabled = true;
   askWithScreenshotBtn.disabled = true;
   chrome.runtime.sendMessage({ type: "LIST_MODELS" }, (resp) => {
+    if (!chrome.runtime?.id) return; // Safety check inside callback
     if (resp && resp.status === "ok" && resp.models && resp.models.models) {
       modelSel.innerHTML = ""; // Clear existing options
       if (resp.models.models.length === 0) {
@@ -131,6 +133,7 @@ function debugPing() {
   if (DEBUG) {
     logToUI("Sending ping to background script");
   }
+  if (!chrome.runtime?.id) return;
   chrome.runtime.sendMessage({ type: "DEBUG_PING" }, (resp) => {
     if (DEBUG) {
       console.log(
@@ -146,9 +149,11 @@ function setDebug(enabled) {
   DEBUG = !!enabled;
   // Use a try-catch block to prevent "context invalidated" errors if panel is closed
   try {
+    if (!chrome.runtime?.id) return;
     chrome.runtime.sendMessage(
       { type: "SET_DEBUG", enabled: DEBUG },
       (resp) => {
+        if (!chrome.runtime?.id) return;
         if (chrome.runtime.lastError) {
           console.error(chrome.runtime.lastError.message);
         } else if (DEBUG) {
@@ -165,9 +170,70 @@ function setDebug(enabled) {
   debugToggleBtn.style.color = DEBUG ? "white" : "black";
 }
 
+// --- Helper to safely send messages to tab (with retry/injection) ---
+function sendMessageToTab(tabId, message, retries = 3) {
+  if (!chrome.runtime?.id) {
+    console.error(
+      "Extension context invalidated. Please close and reopen DevTools."
+    );
+    return;
+  }
+
+  try {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (!chrome.runtime?.id) return; // Context died during request
+
+      if (chrome.runtime.lastError) {
+        const err = chrome.runtime.lastError.message;
+        console.warn(`[Msg Fail] Attempt remaining ${retries}: ${err}`);
+
+        if (retries > 0 && err.includes("Receiving end does not exist")) {
+          // Inject the content script again if it's missing
+          logStatus("Re-injecting content script...", true);
+
+          if (chrome.tabs.executeScript) {
+            chrome.tabs.executeScript(tabId, { file: "content.js" }, () => {
+              if (!chrome.runtime?.id) return;
+              if (chrome.runtime.lastError) {
+                logStatus(
+                  "Injection failed: " + chrome.runtime.lastError.message,
+                  true
+                );
+              } else {
+                setTimeout(
+                  () => sendMessageToTab(tabId, message, retries - 1),
+                  500
+                );
+              }
+            });
+          } else {
+            logStatus(
+              "Cannot inject content script: API unavailable. Please reload page.",
+              true
+            );
+          }
+        } else {
+          logStatus("Error executing action on page: " + err, true);
+        }
+      } else {
+        logStatus(`Action successful: ${response?.message || "OK"}`);
+        // Optional: Trigger next loop here if needed
+      }
+    });
+  } catch (e) {
+    console.error("Error sending message:", e);
+    logStatus("Extension error: " + e.message, true);
+  }
+}
+
 // --- Main Automation Loop ---
 function runAutomationLoop() {
   if (!isAutomationRunning) return;
+  if (!chrome.runtime?.id) {
+    logStatus("Extension context invalidated. Stopping.", true);
+    isAutomationRunning = false;
+    return;
+  }
 
   logStatus("Capturing screen for visual analysis...");
 
@@ -227,12 +293,13 @@ Example:
 - Return ONLY the JSON object.
 `;
 
+        if (!chrome.runtime?.id) return;
         chrome.runtime.sendMessage(
           {
             type: "ASK_OLLAMA",
             model: modelSel.value,
             prompt: visionPrompt,
-            image: base64Image, // Crucial: Sending the image
+            image: base64Image,
             stream: false,
             tabId: INSPECTED_TAB_ID,
             history: conversationHistory,
@@ -250,11 +317,29 @@ Example:
             // 3. Handle Response & Execute
             try {
               // 1. Parse the JSON from LLaVA
-              // Clean markdown code blocks if present
-              const cleanText = resp.result.response
-                .replace(/```json|```/g, "")
-                .trim();
-              const aiData = JSON.parse(cleanText);
+              const rawText = resp.result?.response ?? "";
+              const cleanText = rawText.replace(/```json|```/g, "").trim();
+
+              // Add a check to ensure we aren't parsing a status message
+              if (cleanText.startsWith("Action initiated")) {
+                // ignore self-generated status messages
+                return;
+              }
+
+              let aiData;
+              try {
+                aiData = JSON.parse(cleanText);
+              } catch (e) {
+                // include the raw cleaned text to make debugging clear
+                logStatus(
+                  "Failed to parse AI response: " +
+                    e.message +
+                    " | Raw: " +
+                    cleanText,
+                  true
+                );
+                return;
+              }
 
               console.log("[DEBUG] Parsed AI Data:", aiData);
 
@@ -276,31 +361,37 @@ Example:
                   )}, Y=${normalizedY.toFixed(2)}`
                 );
 
-                // Send the Coordinate Action to Content Script
-                chrome.tabs.sendMessage(
-                  INSPECTED_TAB_ID,
+                // Use background helper to send to tab reliably
+                chrome.runtime.sendMessage(
                   {
-                    type: "EXECUTE_COORDINATE_ACTION",
-                    action: aiData.action || "click",
-                    x: normalizedX,
-                    y: normalizedY,
-                    value: originalUserPrompt, // Pass the prompt in case we need to type something
+                    type: "SEND_TO_TAB",
+                    tabId: INSPECTED_TAB_ID,
+                    payload: {
+                      type: "EXECUTE_COORDINATE_ACTION",
+                      action: aiData.action || "click",
+                      x: normalizedX,
+                      y: normalizedY,
+                      value: originalUserPrompt,
+                    },
                   },
-                  (response) => {
-                    // Handle the result from the content script
+                  (sendResp) => {
                     if (chrome.runtime.lastError) {
                       logStatus(
-                        "Error sending to page: " +
+                        "Error sending to background: " +
                           chrome.runtime.lastError.message,
+                        true
+                      );
+                    } else if (!sendResp || sendResp.status === "error") {
+                      logStatus(
+                        "Failed to deliver coordinate action: " +
+                          (sendResp?.message || "unknown"),
                         true
                       );
                     } else {
                       logStatus(
-                        `Action complete: ${
-                          response?.message || "Click successful"
-                        }`
+                        "Coordinate action forwarded to page: " +
+                          (sendResp.message || "OK")
                       );
-                      // Optional: Trigger next loop here
                     }
                   }
                 );
@@ -368,6 +459,7 @@ function setupEventListeners() {
     const model = modelSel.value;
     const stream = streamChk.checked;
 
+    if (!chrome.runtime?.id) return;
     chrome.runtime.sendMessage(
       {
         type: "ASK_OLLAMA",
@@ -378,6 +470,7 @@ function setupEventListeners() {
         history: conversationHistory,
       },
       (resp) => {
+        if (!chrome.runtime?.id) return;
         if (!resp) {
           resultDiv.textContent =
             "No response from background. (Service worker may have crashed)";

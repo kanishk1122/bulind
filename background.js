@@ -129,6 +129,77 @@ function sendPanelMessage(message, tabId) {
   chrome.runtime.sendMessage({ ...message, tabId });
 }
 
+function sendMessageToTab(tabId, message, retries = 3, cb = () => {}) {
+  chrome.tabs.sendMessage(tabId, message, (response) => {
+    if (chrome.runtime.lastError) {
+      const err = chrome.runtime.lastError.message;
+      logDebug(
+        `[SEND_TO_TAB] Attempt remaining ${retries}: ${err}`,
+        null,
+        tabId
+      );
+      // If content script missing, try to inject then retry
+      if (retries > 0 && err.includes("Receiving end does not exist")) {
+        logDebug("[SEND_TO_TAB] Re-injecting content script...", null, tabId);
+        // Try manifest v3 / v2 compatible injection
+        if (chrome.scripting && chrome.scripting.executeScript) {
+          // Manifest V3 style injection
+          chrome.scripting.executeScript(
+            { target: { tabId }, files: ["content.js"] },
+            () => {
+              if (chrome.runtime.lastError) {
+                logDebug(
+                  "[SEND_TO_TAB] scripting.executeScript failed",
+                  chrome.runtime.lastError.message,
+                  tabId
+                );
+                cb({
+                  status: "error",
+                  message: chrome.runtime.lastError.message,
+                });
+              } else {
+                setTimeout(
+                  () => sendMessageToTab(tabId, message, retries - 1, cb),
+                  400
+                );
+              }
+            }
+          );
+        } else if (chrome.tabs.executeScript) {
+          // Manifest V2 fallback
+          chrome.tabs.executeScript(tabId, { file: "content.js" }, () => {
+            if (chrome.runtime.lastError) {
+              logDebug(
+                "[SEND_TO_TAB] tabs.executeScript failed",
+                chrome.runtime.lastError.message,
+                tabId
+              );
+              cb({
+                status: "error",
+                message: chrome.runtime.lastError.message,
+              });
+            } else {
+              setTimeout(
+                () => sendMessageToTab(tabId, message, retries - 1, cb),
+                400
+              );
+            }
+          });
+        } else {
+          logDebug("[SEND_TO_TAB] No injection API available", null, tabId);
+          cb({ status: "error", message: "No injection API available" });
+        }
+      } else {
+        logDebug("[SEND_TO_TAB] Final failure", err, tabId);
+        cb({ status: "error", message: err });
+      }
+    } else {
+      logDebug("[SEND_TO_TAB] Message delivered, response:", response, tabId);
+      cb({ status: "ok", message: response?.message || "OK", response });
+    }
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
@@ -146,6 +217,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           console.log("[Ollama Assistant BG]", "Ping from panel received");
         sendResponse({ status: "ok", message: "pong" });
         return;
+      }
+
+      // NEW BRANCH: forward arbitrary message to a tab robustly
+      if (message && message.type === "SEND_TO_TAB") {
+        const { tabId, payload } = message;
+        // call helper and respond asynchronously
+        sendMessageToTab(tabId, payload, 3, (result) => {
+          if (result && result.status === "ok") {
+            sendResponse({
+              status: "ok",
+              message: result.message,
+              response: result.response,
+            });
+          } else {
+            sendResponse({
+              status: "error",
+              message: result?.message || "Failed to send to tab",
+            });
+          }
+        });
+        return true; // keep channel open
       }
 
       if (message.type === "ASK_OLLAMA") {
@@ -306,7 +398,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
 
           // NOW proceed with your existing check
-          if (actionCommand && actionCommand.action) {
+          // MODIFIED: Skip auto-execution if box_2d is present (Visual Automation)
+          // This allows panel.js to handle the coordinate calculation.
+          if (actionCommand && actionCommand.action && !actionCommand.box_2d) {
             if (
               actionCommand.action === "error" ||
               actionCommand.action === "done" ||
