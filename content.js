@@ -1,6 +1,50 @@
 // contentScript.js - Content script to execute automation commands
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // --- HANDLE VISUAL CLICK ---
+  if (message.type === "EXECUTE_COORDINATE_ACTION") {
+    // 1. Translate relative (0.5, 0.5) to pixels (960px, 540px)
+    const screenX = Math.floor(message.x * window.innerWidth);
+    const screenY = Math.floor(message.y * window.innerHeight);
+
+    console.log(`[AI Robot] Clicking at ${screenX}, ${screenY}`);
+
+    // 2. Identify the element at that specific point
+    const target = document.elementFromPoint(screenX, screenY);
+
+    if (target) {
+      // 3. Highlight it briefly for debugging (Optional)
+      const originalBorder = target.style.border;
+      target.style.border = "3px solid red";
+      setTimeout(() => (target.style.border = originalBorder), 1000);
+
+      // 4. Perform Action
+      if (message.action === "click") {
+        target.click();
+        target.focus();
+        sendResponse({
+          status: "success",
+          message: `Clicked <${target.tagName}>`,
+        });
+      } else if (message.action === "type") {
+        target.focus();
+        target.value = message.value;
+        // Dispatch input events so React/Vue sites react
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        sendResponse({
+          status: "success",
+          message: `Typed into <${target.tagName}>`,
+        });
+      }
+    } else {
+      sendResponse({
+        status: "error",
+        message: "No element found at coordinates",
+      });
+    }
+    return true; // Keep channel open
+  }
+
   // Optional: Keep GET_PAGE_CONTEXT listener for compatibility, though DevTools panel might use eval()
   if (message && message.type === "GET_PAGE_CONTEXT") {
     const title = document.title;

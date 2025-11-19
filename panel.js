@@ -32,6 +32,11 @@ function getPageHTMLEval(callback) {
   });
 }
 
+// These functions are no longer needed for the visual automation loop.
+// function getCleanedPageHTML(callback) { ... }
+// function getInteractiveMap(tabId, callback) { ... }
+// function getTargetedHTML(tabId, selector, callback) { ... }
+
 // Get the tab ID for the inspected window once.
 const INSPECTED_TAB_ID = chrome.devtools.inspectedWindow.tabId;
 
@@ -162,128 +167,164 @@ function setDebug(enabled) {
 
 // --- Main Automation Loop ---
 function runAutomationLoop() {
-  if (!isAutomationRunning) {
-    console.log("Automation stopped.");
-    askBtn.disabled = false;
-    askWithScreenshotBtn.disabled = false;
-    askWithScreenshotBtn.textContent = "Ask with Screenshot";
-    return;
-  }
+  if (!isAutomationRunning) return;
 
-  logStatus("Capturing screen and page state...");
+  logStatus("Capturing screen for visual analysis...");
 
-  getPageHTMLEval((html) => {
-    if (!html) {
-      logStatus("Error: Failed to get page HTML. Stopping automation.", true);
+  // 1. Capture Screenshot
+  chrome.tabs.get(INSPECTED_TAB_ID, (tab) => {
+    if (chrome.runtime.lastError || !tab) {
+      logStatus(
+        `Error getting tab details: ${
+          chrome.runtime.lastError?.message || "Unknown error"
+        }. Stopping.`,
+        true
+      );
       isAutomationRunning = false;
       return;
     }
+    chrome.tabs.captureVisibleTab(
+      tab.windowId,
+      { format: "jpeg" },
+      (dataUrl) => {
+        if (chrome.runtime.lastError || !dataUrl) {
+          logStatus(
+            `Error capturing screen: ${
+              chrome.runtime.lastError?.message || "Unknown error"
+            }. Stopping.`,
+            true
+          );
+          isAutomationRunning = false;
+          return;
+        }
 
-    chrome.tabs.get(INSPECTED_TAB_ID, (tab) => {
-      if (chrome.runtime.lastError || !tab) {
-        logStatus(
-          `Error getting tab details: ${
-            chrome.runtime.lastError?.message || "Unknown error"
-          }. Stopping automation.`,
-          true
-        );
-        isAutomationRunning = false;
-        return;
-      }
+        const base64Image = dataUrl.split(",")[1];
 
-      chrome.tabs.captureVisibleTab(
-        tab.windowId,
-        { format: "jpeg" },
-        (dataUrl) => {
-          if (chrome.runtime.lastError || !dataUrl) {
-            logStatus(
-              `Error capturing screen: ${
-                chrome.runtime.lastError?.message || "Unknown error"
-              }. Stopping automation.`,
-              true
-            );
-            isAutomationRunning = false;
-            return;
-          }
+        // 2. Send Image to LLaVA
+        const visionPrompt = `
+You are a web automation agent. You are looking at a screenshot of a web page.
 
-          logStatus("Analyzing screenshot and deciding next action...");
-          const base64Image = dataUrl.split(",")[1];
-          const model = Array.from(modelSel.options).find(
-            (opt) =>
-              opt.value.includes("llava") || opt.value.includes("bakllava")
-          )?.value;
+User's Goal: "${originalUserPrompt}"
 
-          const fullPrompt = `You are an expert web automation assistant. Your goal is to complete the user's request by converting it into a series of structured JSON actions.
+Task: Identify the specific UI element (button, link, input) that the user needs to interact with to achieve their goal.
 
-Analyze the user's overall goal, the history of your previous actions, the latest observation, the current screenshot, and the HTML content to determine the single next action to take.
+Output Format:
+Return a JSON object containing the coordinates of the element.
+Use a 1000x1000 coordinate system (where 0,0 is top-left and 1000,1000 is bottom-right).
 
-You have the following actions available:
-- "click": Clicks on an element. Requires a "selector".
-- "type": Types text into an input field. Requires a "selector" and a "value".
-- "scroll": Scrolls the main window. Can take a "value" for the vertical position.
-- "scroll_to_element": Scrolls a specific element into view. Requires a "selector".
-- "wait": Pauses execution. Requires a "value" in milliseconds.
-- "submit": Submits the form containing a given element. Requires a "selector".
-- "navigate": Navigates to a new URL. Requires a "value" for the URL.
-- "get_text": Gets the text content of an element. Requires a "selector".
-- "get_value": Gets the value of a form element. Requires a "selector".
-- "done": Signals that the user's request is complete. Use this when you believe the task is fully finished.
-- "answer": Respond with a text answer if the user asks a question you can answer from the context. Requires a "value".
+Response Schema:
+{
+  "action": "click" | "type",
+  "box_2d": [ymin, xmin, ymax, xmax], 
+  "reason": "Brief explanation of why you chose this element"
+}
 
-Your response MUST be a single JSON object and nothing else. Do not add explanations or conversational text.
-{"action": "action_name", "selector": "css_selector", "value": "text_or_number"}
+Example:
+{"action": "click", "box_2d": [10, 10, 50, 200], "reason": "This is the search bar"}
 
-- The "selector" must be a valid and specific CSS selector.
-- If the user's request cannot be fulfilled, respond with: {"action": "error", "message": "I cannot fulfill that request."}
+🚫 STRICT CONSTRAINTS:
+- Do NOT return CSS selectors.
+- Return ONLY the JSON object.
+`;
 
-User's Goal: ${originalUserPrompt}
+        chrome.runtime.sendMessage(
+          {
+            type: "ASK_OLLAMA",
+            model: modelSel.value,
+            prompt: visionPrompt,
+            image: base64Image, // Crucial: Sending the image
+            stream: false,
+            tabId: INSPECTED_TAB_ID,
+            history: conversationHistory,
+          },
+          (resp) => {
+            if (!resp || resp.status === "error") {
+              logStatus(
+                `AI failed: ${resp?.message || "No response"}. Stopping.`,
+                true
+              );
+              isAutomationRunning = false;
+              return;
+            }
 
-History of previous actions and observations:
-${conversationHistory.map((h) => `${h.role}: ${h.content}`).join("\n")}
+            // 3. Handle Response & Execute
+            try {
+              // 1. Parse the JSON from LLaVA
+              // Clean markdown code blocks if present
+              const cleanText = resp.result.response
+                .replace(/```json|```/g, "")
+                .trim();
+              const aiData = JSON.parse(cleanText);
 
-HTML Content of the current page:
-\`\`\`html
-${html}
-\`\`\``;
+              console.log("[DEBUG] Parsed AI Data:", aiData);
 
-          logToUI("Sending request to background script for AI action.");
-          chrome.runtime.sendMessage(
-            {
-              type: "ASK_OLLAMA",
-              model,
-              prompt: fullPrompt,
-              stream: false,
-              tabId: INSPECTED_TAB_ID,
-              image: base64Image,
-              history: conversationHistory, // Send full history for context
-            },
-            (resp) => {
-              if (!resp || resp.status === "error") {
+              // 2. Check if we have Coordinates (Vision Approach)
+              if (aiData.box_2d && aiData.box_2d.length === 4) {
+                const [ymin, xmin, ymax, xmax] = aiData.box_2d;
+
+                // Calculate the center point (normalized 0-1000 scale)
+                const centerX = (xmin + xmax) / 2;
+                const centerY = (ymin + ymax) / 2;
+
+                // Convert to 0.0 - 1.0 float for the content script
+                const normalizedX = centerX / 1000;
+                const normalizedY = centerY / 1000;
+
                 logStatus(
-                  `Error from AI: ${
-                    resp?.message || "No response"
-                  }. Stopping automation.`,
+                  `AI targeted coordinates: X=${normalizedX.toFixed(
+                    2
+                  )}, Y=${normalizedY.toFixed(2)}`
+                );
+
+                // Send the Coordinate Action to Content Script
+                chrome.tabs.sendMessage(
+                  INSPECTED_TAB_ID,
+                  {
+                    type: "EXECUTE_COORDINATE_ACTION",
+                    action: aiData.action || "click",
+                    x: normalizedX,
+                    y: normalizedY,
+                    value: originalUserPrompt, // Pass the prompt in case we need to type something
+                  },
+                  (response) => {
+                    // Handle the result from the content script
+                    if (chrome.runtime.lastError) {
+                      logStatus(
+                        "Error sending to page: " +
+                          chrome.runtime.lastError.message,
+                        true
+                      );
+                    } else {
+                      logStatus(
+                        `Action complete: ${
+                          response?.message || "Click successful"
+                        }`
+                      );
+                      // Optional: Trigger next loop here
+                    }
+                  }
+                );
+              }
+              // 3. Fallback: Check if we have a Selector (HTML Approach)
+              else if (aiData.selector) {
+                // ... your old selector logic here ...
+                logStatus(
+                  "AI returned a selector, but this mode is not supported yet.",
                   true
                 );
-                isAutomationRunning = false;
-                return;
+              } else {
+                logStatus(
+                  "Error: AI did not return valid coordinates or selector.",
+                  true
+                );
               }
-
-              const text =
-                resp.result?.response ||
-                resp.result?.message ||
-                JSON.stringify(resp.result);
-
-              // The background script will now handle the action and send a status update,
-              // which will trigger the next loop iteration via the message listener.
-              // We just display the intended action here.
-              logStatus(`AI decided action: ${text}`);
-              // The 'AUTOMATION_STATUS' message listener will call runAutomationLoop() again.
+            } catch (e) {
+              logStatus("Failed to parse AI response: " + e.message, true);
             }
-          );
-        }
-      );
-    });
+          }
+        );
+      }
+    );
   });
 }
 

@@ -24,10 +24,7 @@ async function getHeaders() {
     chrome.storage.local.get("ollamaApiKey", (data) => {
       const headers = { "Content-Type": "application/json" };
       if (data.ollamaApiKey) {
-        // headers["Authorization"] = `Bearer ${data.ollamaApiKey}`;
-
-        // for developemnet and testin purpose
-        headers["Authorization"] = `Bearer my-secret-key-123`;
+        headers["Authorization"] = `Bearer ${data.ollamaApiKey}`;
       }
       resolve(headers);
     });
@@ -74,7 +71,8 @@ async function callOllamaGenerate(
   }
 
   if (!stream) {
-    const result = await resp.json();
+    let result = await resp.json();
+    delete result.context;
     logDebug("Ollama non-stream response", result, tabId);
     return result;
   } else {
@@ -198,19 +196,64 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           let actionCommand = null;
           let responseText = result.response;
 
-          // Sanitize: Extract JSON from markdown code blocks (```json ... ```
-          const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/);
-          if (jsonMatch && jsonMatch[1]) {
-            responseText = jsonMatch[1];
+          // --- ROBUST JSON EXTRACTION START ---
+
+          // 1. Try to extract from Markdown code blocks (ignoring the language label like 'css' or 'json')
+          // Regex: Matches ``` followed by optional word (language), captures content, ends with ```
+          const codeBlockMatch = responseText.match(
+            /```(?:\w+)?\s*([\s\S]*?)\s*```/
+          );
+
+          if (codeBlockMatch && codeBlockMatch[1]) {
+            // If we found a code block, use its content
+            responseText = codeBlockMatch[1];
           }
 
+          // 2. Attempt to parse
           try {
             actionCommand = JSON.parse(responseText);
-            logDebug("Parsed action command", actionCommand, tabId);
+            logDebug(
+              "Parsed action command successfully",
+              actionCommand,
+              tabId
+            );
           } catch (e) {
+            // 3. Fallback: If direct parsing failed (maybe no backticks, or extra text outside backticks),
+            // try to find the first '{' and the last '}' and parse that substring.
+            logDebug(
+              "Direct parse failed, attempting heuristic JSON extraction...",
+              null,
+              tabId
+            );
+
+            const firstOpen = responseText.indexOf("{");
+            const lastClose = responseText.lastIndexOf("}");
+
+            if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
+              const potentialJson = responseText.substring(
+                firstOpen,
+                lastClose + 1
+              );
+              try {
+                actionCommand = JSON.parse(potentialJson);
+                logDebug(
+                  "Heuristic extraction successful",
+                  actionCommand,
+                  tabId
+                );
+              } catch (e2) {
+                // If this fails, the JSON is truly malformed
+                logDebug("Heuristic extraction failed", e2.message, tabId);
+              }
+            }
+          }
+
+          // --- ROBUST JSON EXTRACTION END ---
+
+          if (!actionCommand) {
             logDebug(
               "AI response was not a structured action JSON.",
-              responseText,
+              result.response, // log original response
               tabId
             );
             // Self-correction: If the AI responds with text, treat it as an observation and continue the loop.
@@ -218,7 +261,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               {
                 type: "AUTOMATION_STATUS",
                 status: "error",
-                message: `AI did not return a valid JSON action. It said: "${responseText.substring(
+                message: `AI did not return a valid JSON action. It said: "${result.response.substring(
                   0,
                   100
                 )}..."`,
@@ -235,6 +278,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return; // Stop further processing for this invalid response
           }
 
+          // CHECK IF JSON IS VALID BUT MISSING THE 'ACTION' KEY
+          if (actionCommand && !actionCommand.action) {
+            logDebug(
+              "AI returned JSON, but it was missing the 'action' key.",
+              actionCommand,
+              tabId
+            );
+
+            // Force a retry or treat as error specifically
+            sendPanelMessage(
+              {
+                type: "AUTOMATION_STATUS",
+                status: "error",
+                message:
+                  "AI returned invalid JSON structure (missing 'action' field).",
+                action: "error",
+              },
+              tabId
+            );
+
+            sendResponse({
+              status: "ok",
+              result: { response: "Invalid JSON structure." },
+            });
+            return;
+          }
+
+          // NOW proceed with your existing check
           if (actionCommand && actionCommand.action) {
             if (
               actionCommand.action === "error" ||
